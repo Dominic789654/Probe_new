@@ -24,9 +24,12 @@ import numpy as np
 import gc
 import pandas as pd
 from sklearn.metrics import classification_report, confusion_matrix
-from collections import Counter
+from collections import Counter, defaultdict
 import multiprocessing
 import tempfile
+import shutil
+import math
+import sys
 from probe_utils import (
     FocalLoss,
     ClassBalancedLoss,
@@ -35,84 +38,6 @@ from probe_utils import (
     MLPProbe,
 )
 
-
-Easy_prompt = """
-### Core Instructions (Simple Problem Mode) ###
-
-* **Clarity and Efficiency are Key:** This problem has been identified as having a straightforward solution. Your primary goal is to present the most direct and elegant path to the answer. Avoid overly complex methods or unnecessarily detailed formal proofs.
-* **Focus on the Core Insight:** Identify the key idea, formula, or observation that unlocks the problem. Your explanation should revolve around this core insight.
-* **Think Like a Teacher:** Present your solution as if you are explaining it to a capable student. The steps should be logical, easy to follow, and build directly upon each other.
-
-### Output Format ###
-
-Your response MUST be structured into the following sections, in this exact order.
-
-**1. Final Answer**
-
-State the final answer clearly and concisely at the very beginning.
-e.g., "The final answer is $42$."
-
-**2. Core Insight**
-
-In a single sentence or two, describe the central trick or principle that makes this problem simple.
-e.g., "The key insight is to recognize that this is a simple arithmetic series, which can be solved instantly with the formula $S_n = n/2(a_1 + a_n)$."
-
-**3. Step-by-Step Solution**
-
-Provide a numbered list of the essential steps to reach the solution. Each step should be brief and clear.
-
-* 1. Identify the given parameters...
-* 2. Apply the relevant formula/technique...
-* 3. Perform the calculation...
-* 4. State the result.
-
-**4. Quick Verification (Optional)**
-
-Briefly describe a simple check to confirm the answer is reasonable.
-e.g., "To verify, we can manually add the first and last few terms to see if the average matches the expected value."
-
-### Self-Correction Instruction ###
-
-Before finalizing your output, review your steps. Is this the simplest possible explanation? Can any step be made clearer or more direct?
-"""
-
-Hard_prompt = """
-### Core Instructions ###
-
-* **Rigor is Paramount:** Your primary goal is to produce a complete and rigorously justified solution. Every step in your solution must be logically sound and clearly explained. A correct final answer derived from flawed or incomplete reasoning is considered a failure.
-* **Honesty About Completeness:** If you cannot find a complete solution, you must **not** guess or create a solution that appears correct but contains hidden flaws or justification gaps. Instead, you should present only significant partial results that you can rigorously prove. A partial result is considered significant if it represents a substantial advancement toward a full solution. Examples include:
-    * Proving a key lemma.
-    * Fully resolving one or more cases within a logically sound case-based proof.
-    * Establishing a critical property of the mathematical objects in the problem.
-    * For an optimization problem, proving an upper or lower bound without proving that this bound is achievable.
-* **Use TeX for All Mathematics:** All mathematical variables, expressions, and relations must be enclosed in TeX delimiters (e.g., `Let $n$ be an integer.`).
-* **Put the final answer within \\boxed{}**
-
-### Output Format ###
-
-Your response MUST be structured into the following sections, in this exact order.
-
-**1. Summary**
-
-Provide a concise overview of your findings. This section must contain two parts:
-
-* **a. Verdict:** State clearly whether you have found a complete solution or a partial solution.
-    * **For a complete solution:** State the final answer, e.g., "I have successfully solved the problem. The final answer is..."
-    * **For a partial solution:** State the main rigorous conclusion(s) you were able to prove, e.g., "I have not found a complete solution, but I have rigorously proven that..."
-* **b. Method Sketch:** Present a high-level, conceptual outline of your solution. This sketch should allow an expert to understand the logical flow of your argument without reading the full detail. It should include:
-    * A narrative of your overall strategy.
-    * The full and precise mathematical statements of any key lemmas or major intermediate results.
-    * If applicable, describe any key constructions or case splits that form the backbone of your argument.
-
-**2. Detailed Solution**
-
-Present the full, step-by-step mathematical proof. Each step must be logically justified and clearly explained. The level of detail should be sufficient for an expert to verify the correctness of your reasoning without needing to fill in any gaps. This section must contain ONLY the complete, rigorous proof, free of any internal commentary, alternative approaches, or failed attempts.
-
-### Self-Correction Instruction ###
-
-Before finalizing your output, carefully review your "Method Sketch" and "Detailed Solution" to ensure they are clean, rigorous, and strictly adhere to all instructions provided above. Verify that every statement contributes directly to the final, coherent mathematical argument.
-
-"""
 # Attempt to import vLLM
 try:
     from vllm import LLM, SamplingParams
@@ -121,6 +46,17 @@ except ImportError:
     LLM = None
     SamplingParams = None
     VLLM_AVAILABLE = False
+
+# Attempt to import xVerify
+try:
+    sys.path.append('/home/zhtang/workspace/xVerify')
+    from src.xVerify.model import Model
+    from src.xVerify.eval import Evaluator
+    XVERIFY_AVAILABLE = True
+except ImportError:
+    Model = None
+    Evaluator = None
+    XVERIFY_AVAILABLE = False
 
 # --- Utility functions from other files ---
 
@@ -299,7 +235,7 @@ class ProbeClassifier:
 
 class VLLMMathProblemSolver:
     """Math problem solver using vLLM for fast generation."""
-    def __init__(self, model_path: str, max_length: int = 2048, tp_size: int = 1):
+    def __init__(self, model_path: str, max_length: int = 2048, tp_size: int = 1, prompt_pool_config: Dict[str, int] = None):
         if not VLLM_AVAILABLE:
             raise RuntimeError("vLLM is not installed. Please install it via 'pip install vllm'")
 
@@ -316,25 +252,92 @@ class VLLMMathProblemSolver:
             trust_remote_code=True,
             dtype="bfloat16",
             enable_prefix_caching=True,
-            gpu_memory_utilization=0.7,
+            gpu_memory_utilization=0.9,
             max_model_len=max_length,
             tensor_parallel_size=tp_size,
         )
+        
+        # Initialize prompt pools
+        self.prompt_pools = self._initialize_prompt_pools()
+        self.prompt_config = prompt_pool_config or {"normal": 0, "too_hard": 0, "too_easy": 0}
         print("vLLM Engine initialized successfully")
+        print(f"Prompt pool configuration: {self.prompt_config}")
+    
+    def _initialize_prompt_pools(self):
+        """
+        Initialize optimized prompt pools V2 based on experimental results.
+        
+        V2 improvements:
+        - Enhanced successful mixed strategy patterns from V1 experiments
+        - Better reasoning guidance for cross-dataset performance  
+        - Optimized balance between accuracy and efficiency
+        - Based on analysis of 92% MATH, 93.5% GSM8K, 66.7% AIME performance
+        """
+        return {
+            "normal": [
+                # 0: Conservative but systematic (best for GSM8K: 93.5%, good for MATH)
+                "<think>\nLet me work through this systematically, ensuring I understand each step before proceeding.",
+                
+                # 1: Structured approach (enhanced from V1 good performers)  
+                "<think>\nI'll break this down into clear, logical steps and solve methodically.",
+                
+                # 2: Analytical focus (balanced approach)
+                "<think>\nLet me analyze the problem structure and identify the most direct solution path.",
+                
+                # 3: Efficient systematic (inspired by (3,1,4) success: 78.7% avg)
+                "<think>\nI need to approach this efficiently while maintaining accuracy. Let me identify the key steps.",
+                
+                # 4: Direct but thorough (aggressive but careful)
+                "<think>\nI can see the solution approach. Let me work through this directly but verify each step."
+            ],
+            "too_hard": [
+                # 0: Conservative resource management
+                "<think>\nThis is complex. I'll focus on the essential approach and avoid getting stuck in lengthy details.",
+                
+                # 1: Strategic efficiency (enhanced from mixed_efficient success)
+                "<think>\nThis looks challenging. Let me identify the core strategy and key insights to solve efficiently.",
+                
+                # 2: Balanced complexity handling
+                "<think>\nThis appears intricate. I'll outline the main method while being mindful of computational resources.",
+                
+                # 3: Insight-focused approach
+                "<think>\nThis seems demanding. Let me focus on the fundamental insights and critical breakthrough points.",
+                
+                # 4: Aggressive efficiency (best for AIME, inspired by (0,4,2) success: 92% MATH)
+                "<think>\nThis is sophisticated. I'll sketch the essential solution path and key steps without extensive computation."
+            ],
+            "too_easy": [
+                # 0: Quick but verified (best for GSM8K: 93.5%)
+                "<think>\nThis looks straightforward. Let me solve it directly while double-checking my approach.</think>",
+                
+                # 1: Efficient with validation (inspired by (2,4,1) efficiency)
+                "<think>\nI can see the solution immediately. Let me apply it efficiently and verify the result.</think>",
+                
+                # 2: Streamlined approach
+                "<think>\nThe method is clear. I'll execute this directly with a quick accuracy check.</think>",
+                
+                # 3: Confident but careful
+                "<think>\nThis has an obvious solution path. Let me implement it while ensuring correctness.</think>",
+                
+                # 4: Direct execution (best for AIME: 66.7%, aggressive approach)
+                "<think>\nI can identify the solution approach immediately. Let me execute it directly.</think>"
+            ]
+        }
 
     def batch_generate_responses(self, questions: List[str], strategies: List[str], 
                                  n_runs: int = 1,
                                  system_prompt: str = None,
                                  max_tokens: int = 2048, temperature: float = 0.6, top_p: float = 0.9,
                                  continuation_prompt: str = "\nNow the correct answer is \\boxed{",
-                                 continuation_max_tokens: int = 128) -> List[List[Dict[str, Any]]]:
+                                 continuation_max_tokens: int = 128,
+                                 enable_continuation: bool = True) -> List[List[Dict[str, Any]]]:
         """Generates responses for a batch of questions based on individual strategies."""
 
         # --- Define Sampling Strategies ---
-        normal_params = SamplingParams(n=n_runs, temperature=temperature, top_p=top_p, max_tokens=max_tokens, logprobs=10)
+        normal_params = SamplingParams(n=n_runs, temperature=0.8, top_p=0.95, max_tokens=max_tokens, logprobs=10)
         # limited_params = SamplingParams(n=n_runs, temperature=temperature, top_p=top_p, max_tokens=max_tokens // 4, logprobs=10)
-        limited_params = SamplingParams(n=n_runs, temperature=temperature/2, top_p=top_p, max_tokens=max_tokens // 4, logprobs=10)
-        hard_params = SamplingParams(n=n_runs, temperature=temperature*2, top_p=top_p, min_p=0.2, max_tokens=max_tokens // 2, logprobs=10, repetition_penalty=1.1)
+        limited_params = SamplingParams(n=n_runs, temperature=0.5, max_tokens=int(max_tokens*0.4) , logprobs=10)
+        hard_params = SamplingParams(n=n_runs, temperature=0.4, max_tokens=int(max_tokens*0.5) , logprobs=10 )
         # hard_params = SamplingParams(n=n_runs, temperature=temperature, top_p=top_p, max_tokens=max_tokens // 2, logprobs=10, repetition_penalty=1.1)
         continuation_params = SamplingParams(n=1, temperature=0.6, top_p=1.0, max_tokens=continuation_max_tokens, stop=["}"], logprobs=10)
 
@@ -345,40 +348,39 @@ class VLLMMathProblemSolver:
 
         for question, strategy in zip(questions, strategies):
             messages = [{"role": "user", "content": question + "\n\nLet's reason step by step, and put your final answer within \\boxed{}."}]
-            # if system_prompt:
-            #     messages.insert(0, {"role": "system", "content": system_prompt})
+            if system_prompt:
+                messages.insert(0, {"role": "system", "content": system_prompt})
 
-            # template = self.tokenizer.apply_chat_template(
-            #     messages,
-            #     tokenize=False, add_generation_prompt=True
-            # )
+            template = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False, add_generation_prompt=True
+            )
             
-            if strategy == "normal":
-                messages.insert(0, {"role": "system", "content": Hard_prompt})
-                template = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False, add_generation_prompt=True
-                )
-                prompt = template + "<think>\nThis problem seems to be of normal difficulty. I will proceed with a step-by-step solution."
+            # Select prompt from pool based on strategy and configuration
+            if strategy in self.prompt_pools and strategy in self.prompt_config:
+                pool_idx = self.prompt_config[strategy]
+                selected_prompt = self.prompt_pools[strategy][pool_idx]
+                prompt = template + selected_prompt
+            else:
+                # Fallback to original prompts if strategy not found
+                if strategy == "simple_baseline":
+                    # For simple baseline, use only the basic template without any <think> additions
+                    prompt = template
+                elif strategy == "normal":
+                    prompt = template + "<think>\nThis problem seems to be of normal difficulty. I will proceed with a step-by-step solution." 
+                elif strategy == "too_hard":
+                    prompt = template + "<think>\nThis problem appears to be quite challenging. To conserve budget, I will outline the key steps and avoid getting stuck in lengthy calculations."
+                else:  # too_easy
+                    prompt = template + "<think>\nThis problem seems to be too easy. I will provide the solution directly.</think>"
+            
+            # Set generation parameters based on strategy
+            if strategy == "simple_baseline":
+                params = normal_params  # Use normal parameters (temp=0.6) for simple baseline
+            elif strategy == "normal":
                 params = normal_params
             elif strategy == "too_hard":
-                messages.insert(0, {"role": "system", "content": Hard_prompt})
-                template = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False, add_generation_prompt=True
-                )
-                prompt = template + "<think>\nThis problem appears to be quite challenging. To conserve budget, I will outline the key steps and avoid getting stuck in lengthy calculations."
-                # prompt = template + "<think></think>"
                 params = hard_params
             else:  # too_easy
-                # prompt = template + "<think></think>"
-                messages.insert(0, {"role": "system", "content": Easy_prompt})
-                template = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False, add_generation_prompt=True
-                )
-                prompt = template + "<think>\nThis problem seems to be too easy. I will provide the solution directly.</think>"  # v4.5
-                # prompt = template + "<think>Okay, I think I have finished thinking.</think>"  # v4.6
                 params = limited_params
             
             first_pass_prompts.append(prompt)
@@ -401,7 +403,7 @@ class VLLMMathProblemSolver:
             for sample_idx, generated_sample in enumerate(output.outputs):
                 result_key = (original_idx, sample_idx)
 
-                if generated_sample.finish_reason == 'length':
+                if generated_sample.finish_reason == 'length' and enable_continuation:
                     continuation_prompt_text = output.prompt + generated_sample.text + continuation_prompt
 
                     prompt_token_ids = self.tokenizer.encode(continuation_prompt_text)
@@ -433,6 +435,17 @@ class VLLMMathProblemSolver:
                     continuation_prompts.append(continuation_prompt_text)
                     continuation_indices.append(result_key)
                     continuation_contexts.append(generated_sample)
+                elif generated_sample.finish_reason == 'length' and not enable_continuation:
+                    # When continuation is disabled, just use the truncated output as is
+                    response_text = "<think>" + output.prompt.split("<think>")[-1] + generated_sample.text
+                    total_entropy, average_entropy, _, _ = calculate_entropy_from_logprobs(generated_sample.logprobs)
+                    result_details = {
+                        'response': response_text,
+                        'total_generated_tokens': len(generated_sample.token_ids),
+                        'total_entropy': total_entropy,
+                        'average_entropy': average_entropy
+                    }
+                    final_results[result_key] = result_details
                 else:
                     response_text = "<think>" + output.prompt.split("<think>")[-1] + generated_sample.text
                     total_entropy, average_entropy, _, _ = calculate_entropy_from_logprobs(generated_sample.logprobs)
@@ -512,19 +525,20 @@ class HFMathProblemSolver:
 
     def generate_response(self, question: str, strategy: str = "normal", max_length: int = 2048, temperature: float = 0.0, system_prompt: str = None) -> Tuple[str, Dict[str, int]]:
         messages = [
-            {"role": "user", "content": question}
+            {"role": "user", "content": question + "\n\nLet's reason step by step, and put your final answer within \\boxed{}."}
         ]
         if system_prompt:
             messages.insert(0, {"role": "system", "content": system_prompt})
-        else:
-            messages.insert(0, {"role": "system", "content": "Let's reason step by step, and put your final answer within \\boxed{}."})
 
         template = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False, add_generation_prompt=True
         )
 
-        if strategy == "think":
+        if strategy == "simple_baseline":
+            # For simple baseline, use only the basic template without any <think> additions
+            prompt = template
+        elif strategy == "think":
             prompt = template + "<think>"
         elif strategy == "too_hard":
             prompt = template + "<think>This problem is too difficult for me. I will give up thinking to save tokens.</think>"
@@ -596,6 +610,16 @@ def parse_args():
     parser.add_argument("--continuation_max_tokens", type=int, default=1024,
                         help="Max tokens for the continuation generation step.")
     parser.add_argument("--offline_entropy_selection", action="store_true", help="Enable offline entropy selection for vLLM generation.")
+    
+    # Prompt pool settings
+    parser.add_argument("--prompt_normal_idx", type=int, default=0, choices=[0, 1, 2, 3, 4],
+                        help="Index of prompt to use for 'normal' strategy (0-4).")
+    parser.add_argument("--prompt_too_hard_idx", type=int, default=0, choices=[0, 1, 2, 3, 4],
+                        help="Index of prompt to use for 'too_hard' strategy (0-4).")
+    parser.add_argument("--prompt_too_easy_idx", type=int, default=0, choices=[0, 1, 2, 3, 4],
+                        help="Index of prompt to use for 'too_easy' strategy (0-4).")
+    parser.add_argument("--search_prompts", action="store_true", 
+                        help="Enable prompt search mode: test all prompt combinations and save results with prompt info.")
 
     return parser.parse_args()
 
@@ -627,25 +651,35 @@ def run_probe_predictions(args, data, classifier):
     print(probe_results_df.groupby('strategy').size())
     return probe_results
 
-def run_generation_stage(args, probe_results):
+def run_generation_stage(args, probe_results, is_baseline_mode=False):
     """Run the generation stage based on probe predictions."""
     print("Loading math problem solver for generation...")
+    
+    # Prepare prompt pool configuration
+    prompt_config = {
+        "normal": args.prompt_normal_idx,
+        "too_hard": args.prompt_too_hard_idx,
+        "too_easy": args.prompt_too_easy_idx
+    }
+    
     if args.use_vllm and VLLM_AVAILABLE:
-        solver = VLLMMathProblemSolver(args.llm_model, args.max_length, args.tp_size)
+        solver = VLLMMathProblemSolver(args.llm_model, args.max_length, args.tp_size, prompt_config)
     else:
         if args.use_vllm:
             print("Warning: vLLM not available, falling back to HuggingFace generator.")
         solver = HFMathProblemSolver(args.llm_model)
 
     system_prompt = None
-    if args.tale_ep_baseline:
+    if args.baseline_mode:
+        system_prompt = None  # Use no system prompt for simple baseline
+    elif args.tale_ep_baseline:
         system_prompt = "You are a helpful and harmless assistant. You should think step-by-step but use as few tokens burgets as possible without compromising performance."
     elif args.concise_cot_baseline:
         system_prompt = "You are a helpful and harmless assistant. You should think step-by-step. Please be concise throughout the reasoning process."
-
+    else:
+        system_prompt = "You are a helpful and harmless assistant. You should think step-by-step. Please be concise throughout the reasoning process."
 
     final_results = []
-    system_prompt = "You are a helpful and harmless assistant. You should think step-by-step. Please be concise throughout the reasoning process."
     print(f"\nProcessing {len(probe_results)} samples...")
     for i in tqdm(range(0, len(probe_results), args.batch_size)):
         batch_chunk = probe_results[i:i + args.batch_size]
@@ -653,6 +687,8 @@ def run_generation_stage(args, probe_results):
         batch_strategies = [res['strategy'] for res in batch_chunk]
 
         if isinstance(solver, VLLMMathProblemSolver):
+            # Disable continuation for baseline modes, enable for probe modes
+            enable_continuation = not is_baseline_mode
             batch_responses_list = solver.batch_generate_responses(
                 batch_questions, 
                 strategies=batch_strategies,
@@ -660,11 +696,15 @@ def run_generation_stage(args, probe_results):
                 max_tokens=args.max_new_tokens,
                 continuation_prompt=args.continuation_prompt,
                 continuation_max_tokens=args.continuation_max_tokens,
-                system_prompt=system_prompt
+                system_prompt=system_prompt,
+                enable_continuation=enable_continuation
             )
         else: # Fallback to single generation
             # Note: HF fallback does not support n_runs > 1 for simplicity.
-            batch_responses_list = [[solver.generate_response(q, s, max_length=args.max_new_tokens, system_prompt=system_prompt)] for q, s in zip(batch_questions, batch_strategies)]
+            batch_responses_list = []
+            for q, s in zip(batch_questions, batch_strategies):
+                temp = 0.6 if s == "simple_baseline" else 0.0
+                batch_responses_list.append([solver.generate_response(q, s, max_length=args.max_new_tokens, temperature=temp, system_prompt=system_prompt)])
 
         for j, responses in enumerate(batch_responses_list):
             probe_res = batch_chunk[j]
@@ -675,6 +715,9 @@ def run_generation_stage(args, probe_results):
                     'run_id': run_idx,
                     **response_details
                 }
+                # Add prompt configuration info if using vLLM with prompt pools
+                if isinstance(solver, VLLMMathProblemSolver) and hasattr(solver, 'prompt_config'):
+                    result_item['prompt_config'] = solver.prompt_config.copy()
                 final_results.append(result_item)
 
 
@@ -728,7 +771,8 @@ def run_offline_entropy_selection(args, data):
             })
             
     # 2. Run generation for all prepared items
-    all_generated_results = run_generation_stage(args, probe_output_results)['results']
+    # Offline entropy selection uses all strategies, enable continuation
+    all_generated_results = run_generation_stage(args, probe_output_results, is_baseline_mode=False)['results']
     
     # 3. Group results by problem
     grouped_by_problem = {}
@@ -747,6 +791,47 @@ def run_offline_entropy_selection(args, data):
         
     print(f"Selected {len(final_selection)} best responses from {len(all_generated_results)} candidates.")
     return final_selection
+
+def run_prompt_search(args, probe_results):
+    """
+    Run prompt search: test all combinations of prompts and save results.
+    This will generate 5^3 = 125 different prompt combinations.
+    """
+    print("Running prompt search mode...")
+    import itertools
+    
+    all_search_results = []
+    prompt_combinations = list(itertools.product(range(5), range(5), range(5)))
+    
+    print(f"Testing {len(prompt_combinations)} prompt combinations...")
+    
+    for combo_idx, (normal_idx, too_hard_idx, too_easy_idx) in enumerate(prompt_combinations):
+        print(f"Testing combination {combo_idx + 1}/{len(prompt_combinations)}: "
+              f"normal={normal_idx}, too_hard={too_hard_idx}, too_easy={too_easy_idx}")
+        
+        # Create temporary args with current prompt configuration
+        temp_args = argparse.Namespace(**vars(args))
+        temp_args.prompt_normal_idx = normal_idx
+        temp_args.prompt_too_hard_idx = too_hard_idx
+        temp_args.prompt_too_easy_idx = too_easy_idx
+        
+        # Run generation with current prompt combination
+        # Prompt search is typically used with probe mode, so enable continuation
+        combo_results = run_generation_stage(temp_args, probe_results, is_baseline_mode=False)['results']
+        
+        # Add combination info to each result
+        for result in combo_results:
+            result['prompt_combination_id'] = combo_idx
+            result['prompt_combination'] = {
+                'normal': normal_idx,
+                'too_hard': too_hard_idx,
+                'too_easy': too_easy_idx
+            }
+        
+        all_search_results.extend(combo_results)
+    
+    print(f"Prompt search completed. Generated {len(all_search_results)} results.")
+    return all_search_results
 
 def run_probe_stage(args, data, output_file):
     """
@@ -780,6 +865,249 @@ def run_probe_stage(args, data, output_file):
             torch.cuda.empty_cache()
         gc.collect()
         print("[Probe Process] Cleaned up resources.")
+
+
+def extract_gsm8k_answer(answer_str: str) -> str:
+    """Extracts the final numerical answer from a GSM8K solution string."""
+    if not isinstance(answer_str, str):
+        return ""
+    if '####' in answer_str:
+        return answer_str.split('####')[-1].strip().replace(',', '')
+    return answer_str
+
+def pass_at_k(n, c, k):
+    """
+    Calculates pass@k.
+    :param n: total number of samples
+    :param c: number of correct samples
+    :param k: k in pass@k
+    """
+    if n - c < k:
+        return 1.0
+    return 1.0 - math.comb(n - c, k) / math.comb(n, k)
+
+def run_bench_evaluation(input_file: str, model_path: str = "/home/zhtang/hf_models/IAAR-Shanghai/xVerify-0.5B-I", pass_k: str = "1,3") -> Dict[str, Any]:
+    """
+    Run bench evaluation on the generated results.
+    Returns evaluation statistics.
+    """
+    if not XVERIFY_AVAILABLE:
+        print("Warning: xVerify not available, skipping bench evaluation.")
+        return {}
+    
+    print(f"Running bench evaluation on {input_file}")
+    
+    temp_dir = None
+    try:
+        # Initialize the xVerify Model and Evaluator
+        print(f"Initializing xVerify evaluator with model from: {model_path}")
+        model = Model(
+            model_name='xVerify-0.5B-I',
+            model_path_or_url=model_path,
+            inference_mode='local',
+            api_key=None
+        )
+        evaluator = Evaluator(model=model)
+        print("Evaluator initialized successfully.")
+
+        # Load original data
+        original_data = []
+        with open(input_file, 'r', encoding='utf-8') as f_in:
+            for line in f_in:
+                original_data.append(json.loads(line))
+        
+        if not original_data:
+            print("No data to evaluate.")
+            return {}
+
+        print(f"Loaded {len(original_data)} entries for evaluation.")
+
+        # Prepare data for evaluation
+        formatted_data_for_eval = []
+        for item in original_data:
+            generated_text = item.get('response', '')
+            if '</think>' in generated_text:
+                llm_output = generated_text.split('</think>', 1)[-1].strip()
+            else:
+                llm_output = generated_text[-1000:] if len(generated_text) > 1000 else generated_text
+            
+            question = item.get('problem', '')
+            correct_answer_raw = item.get('ground_truth_answer', '')
+            correct_answer = extract_gsm8k_answer(correct_answer_raw)
+
+            formatted_data_for_eval.append({
+                "question": question,
+                "llm_output": llm_output,
+                "correct_answer": correct_answer
+            })
+
+        # Create temporary files for evaluation
+        temp_dir = tempfile.mkdtemp()
+        temp_input_path = os.path.join(temp_dir, "eval_input.json")
+        temp_output_dir_path = os.path.join(temp_dir, "eval_output")
+        
+        with open(temp_input_path, 'w', encoding='utf-8') as f:
+            json.dump(formatted_data_for_eval, f, indent=4)
+        
+        print(f"Prepared temporary data for batch evaluation at: {temp_input_path}")
+
+        # Run the batch evaluation
+        print(f"Starting batch evaluation...")
+        evaluator.evaluate(
+            data_path=temp_input_path,
+            data_size=len(formatted_data_for_eval),
+            output_path=temp_output_dir_path
+        )
+        print("Batch evaluation complete.")
+
+        # Parse results
+        result_files = [f for f in os.listdir(temp_output_dir_path) if f.endswith('.json')]
+        if not result_files:
+            raise FileNotFoundError("No result file found in the xVerify output directory.")
+        
+        actual_output_file_path = os.path.join(temp_output_dir_path, result_files[0])
+        print(f"Found and reading evaluation results from: {actual_output_file_path}")
+
+        with open(actual_output_file_path, 'r', encoding='utf-8') as f_eval:
+            eval_data_dict = json.load(f_eval)
+            eval_results_list = eval_data_dict.get('results', [])
+
+        if len(original_data) != len(eval_results_list):
+            print(f"Warning: Mismatch between processed items ({len(original_data)}) and evaluated items ({len(eval_results_list)}). Merging based on index.")
+        
+        print(f"Merging {len(eval_results_list)} evaluation results with original data...")
+        
+        # Merge results and calculate statistics
+        k_values = [int(k) for k in pass_k.split(',')]
+        
+        # Group results by problem
+        problems = defaultdict(list)
+        
+        for i, original in enumerate(original_data):
+            if i >= len(eval_results_list):
+                break
+            
+            evaluation = eval_results_list[i]
+            judgment_key = f"{model.model_name}_judgment_result"
+            judgment_result = evaluation.get(judgment_key)
+
+            correctness = None
+            if isinstance(judgment_result, dict):
+                correctness = judgment_result.get('Correctness')
+            elif isinstance(judgment_result, str):
+                correctness = judgment_result
+
+            # Add evaluation result to original data
+            original['xverify_evaluation'] = {
+                'Correctness': correctness,
+            }
+            
+            problems[original['problem']].append(original)
+        
+        # Calculate statistics
+        strategy_stats = defaultdict(lambda: {'problems': defaultdict(list)})
+        
+        for problem, runs in problems.items():
+            strategy = runs[0]['strategy']
+            strategy_stats[strategy]['problems'][problem].extend(runs)
+
+        print("\n--- Bench Evaluation Results ---")
+        
+        overall_problem_count = len(problems)
+        overall_pass_at_k = {k: 0 for k in k_values}
+        overall_avg_tokens = 0
+        overall_total_correct_runs = 0
+        overall_total_runs = 0
+        
+        results_summary = {}
+
+        for strategy, s_stats in sorted(strategy_stats.items()):
+            num_problems = len(s_stats['problems'])
+            strategy_pass_at_k = {k: 0 for k in k_values}
+            strategy_total_tokens = 0
+            strategy_total_correct_runs = 0
+            strategy_total_runs = 0
+            
+            for problem, runs in s_stats['problems'].items():
+                n_runs = len(runs)
+                c_correct = sum(1 for r in runs if r.get('xverify_evaluation', {}).get('Correctness') == 'Correct')
+                strategy_total_correct_runs += c_correct
+                strategy_total_runs += n_runs
+                
+                for k in k_values:
+                    strategy_pass_at_k[k] += pass_at_k(n_runs, c_correct, k)
+                
+                strategy_total_tokens += sum(r.get('total_generated_tokens', 0) for r in runs)
+
+            overall_total_correct_runs += strategy_total_correct_runs
+            overall_total_runs += strategy_total_runs
+
+            avg_tokens_per_problem = (strategy_total_tokens / num_problems) if num_problems > 0 else 0
+            avg_tokens_per_sample = (strategy_total_tokens / strategy_total_runs) if strategy_total_runs > 0 else 0
+            
+            strategy_avg_pass_1 = (strategy_total_correct_runs / strategy_total_runs) * 100 if strategy_total_runs > 0 else 0
+            
+            print(f"Strategy: {strategy} ({num_problems} problems)")
+            print(f"  Avg Pass@1: {strategy_avg_pass_1:.2f}%")
+            
+            strategy_results = {
+                'num_problems': num_problems,
+                'avg_pass_1': strategy_avg_pass_1,
+                'avg_tokens_per_problem': avg_tokens_per_problem,
+                'avg_tokens_per_sample': avg_tokens_per_sample,
+                'pass_at_k': {}
+            }
+            
+            for k in k_values:
+                pass_k_avg = (strategy_pass_at_k[k] / num_problems) * 100 if num_problems > 0 else 0
+                print(f"  Pass@{k}: {pass_k_avg:.2f}%")
+                strategy_results['pass_at_k'][k] = pass_k_avg
+                overall_pass_at_k[k] += strategy_pass_at_k[k]
+            
+            print(f"  Average Tokens per Problem: {avg_tokens_per_problem:.2f}")
+            print(f"  Average Tokens per Sample: {avg_tokens_per_sample:.2f}")
+            overall_avg_tokens += strategy_total_tokens
+            
+            results_summary[strategy] = strategy_results
+
+        print("\n--- Overall Statistics ---")
+        overall_avg_pass_1 = (overall_total_correct_runs / overall_total_runs) * 100 if overall_total_runs > 0 else 0
+        print(f"Overall Avg Pass@1: {overall_avg_pass_1:.2f}%")
+        
+        overall_results = {
+            'avg_pass_1': overall_avg_pass_1,
+            'pass_at_k': {},
+            'avg_tokens_per_problem': 0,
+            'avg_tokens_per_sample': 0
+        }
+        
+        for k in k_values:
+            overall_pass_k_avg = (overall_pass_at_k[k] / overall_problem_count) * 100 if overall_problem_count > 0 else 0
+            print(f"Overall Pass@{k}: {overall_pass_k_avg:.2f}%")
+            overall_results['pass_at_k'][k] = overall_pass_k_avg
+
+        grand_total_avg_tokens = overall_avg_tokens / overall_problem_count if overall_problem_count > 0 else 0
+        print(f"Overall Average Tokens per Problem: {grand_total_avg_tokens:.2f}")
+        overall_results['avg_tokens_per_problem'] = grand_total_avg_tokens
+
+        grand_total_avg_tokens_per_sample = overall_avg_tokens / overall_total_runs if overall_total_runs > 0 else 0
+        print(f"Overall Average Tokens per Sample: {grand_total_avg_tokens_per_sample:.2f}")
+        overall_results['avg_tokens_per_sample'] = grand_total_avg_tokens_per_sample
+        
+        return {
+            'overall': overall_results,
+            'strategies': results_summary
+        }
+
+    except Exception as e:
+        print(f"An error occurred during bench evaluation: {e}")
+        return {}
+    
+    finally:
+        # Clean up temporary directory
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            print(f"Cleaned up temporary directory: {temp_dir}")
 
 
 def main():
@@ -819,18 +1147,19 @@ def main():
 
         if args.baseline_mode or args.tale_ep_baseline or args.concise_cot_baseline:
             if args.baseline_mode:
-                print("Running in baseline mode. All samples will use the 'normal' strategy.")
+                print("Running in baseline mode. All samples will use the 'simple_baseline' strategy.")
             elif args.tale_ep_baseline:
                 print("Running in TALE-EP baseline mode. All samples will use the 'normal' strategy.")
             elif args.concise_cot_baseline:
                 print("Running in ConciseCOT baseline mode. All samples will use the 'normal' strategy.")
             probe_output_results = []
             for i, item in enumerate(data):
+                strategy = 'simple_baseline' if args.baseline_mode else 'normal'
                 probe_output_results.append({
                     'data_index': i,
                     'problem': item['problem'],
                     'ground_truth_answer': item.get('answer'),
-                    'strategy': 'normal',
+                    'strategy': strategy,
                     'final_prediction': 1,  # Corresponds to 'normal'
                     'final_confidence': 1.0,
                     'probabilities': [0.0, 1.0, 0.0] 
@@ -901,8 +1230,16 @@ def main():
         
         # Generation Stage
         if not args.only_probe_prediction:
-            final_output = run_generation_stage(args, probe_output_results)
-            results_to_save = final_output['results']
+            # Determine if we're in baseline mode
+            is_baseline = args.baseline_mode or args.tale_ep_baseline or args.concise_cot_baseline or args.full_baseline_mode or args.random_baseline_mode
+            
+            if args.search_prompts:
+                # Run prompt search mode
+                results_to_save = run_prompt_search(args, probe_output_results)
+            else:
+                # Normal generation mode
+                final_output = run_generation_stage(args, probe_output_results, is_baseline_mode=is_baseline)
+                results_to_save = final_output['results']
         else:
             # Re-wrap the probe results in the expected format if only predicting
             results_to_save = probe_output_results
@@ -910,6 +1247,17 @@ def main():
 
         save_results(args, results_to_save)
         print("Inference completed successfully.")
+        
+        # Run bench evaluation if not in probe-only mode
+        if not args.only_probe_prediction:
+            print("\n" + "="*60)
+            print("Starting bench evaluation...")
+            bench_results = run_bench_evaluation(args.output_path)
+            if bench_results:
+                print("Bench evaluation completed successfully.")
+            else:
+                print("Bench evaluation was skipped or failed.")
+            print("="*60)
 
     except Exception as e:
         print(f"An error occurred: {e}")
